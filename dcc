@@ -1,4 +1,15 @@
 #!/bin/bash
 # DCC - Disk Cleanup Consultant
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/cleanup-tui.py" "${@:-$SCRIPT_DIR/test/sample-findings.json}"
+DEFAULT_SCAN="$HOME/.dcc/scan.json"
+FALLBACK="$SCRIPT_DIR/test/sample-findings.json"
+
+if [ -n "$1" ]; then
+    INPUT="$1"
+elif [ -f "$DEFAULT_SCAN" ]; then
+    INPUT="$DEFAULT_SCAN"
+else
+    INPUT="$FALLBACK"
+fi
+
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/cleanup-tui.py" "$INPUT"

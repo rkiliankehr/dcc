@@ -1,0 +1,4 @@
+#!/bin/bash
+# DCC Scout - Filesystem scanner wrapper
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/dcc-scout.py" "$@"

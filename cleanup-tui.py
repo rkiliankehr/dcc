@@ -374,7 +374,8 @@ class CleanupApp(App):
         Binding("left", "prev_action", "←", priority=True),
         Binding("right", "next_action", "→", priority=True),
         Binding("space", "toggle_mark", "Mark", priority=True),
-        Binding("s", "toggle_snooze", "Snooze"),
+        Binding("s", "toggle_hide_skip", "Hide Skip"),
+        Binding("z", "toggle_snooze", "Snooze"),
         Binding("i", "inspect", "Inspect"),
         Binding("ctrl+x", "execute", "Execute", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
@@ -384,7 +385,9 @@ class CleanupApp(App):
         super().__init__()
         self.findings_file = findings_file
         self.findings_data = None
-        self.items = []
+        self.findings = []  # Sorted findings list
+        self.item_state = {}  # State by index: {idx: {marked, snoozed, selected_action}}
+        self.hide_skip = False  # Toggle to hide items with "skip" recommendation
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-container"):
@@ -394,16 +397,7 @@ class CleanupApp(App):
             yield Static(id="details-panel")
 
         # Custom nav bar - magenta/violet spectrum, execute highlighted on right
-        yield Static(
-            "[bold magenta]↑↓[/] Navigate  "
-            "[bold magenta]←→[/] Action  "
-            "[bold magenta]space[/] Mark  "
-            "[bold magenta]s[/] Snooze  "
-            "[bold magenta]i[/] Inspect  "
-            "[bold magenta]^q[/] Quit  "
-            "[bold rgb(0,255,0)]^x Execute[/]",
-            id="main-nav"
-        )
+        yield Static(id="main-nav")
 
     def on_mount(self) -> None:
         # Load findings
@@ -411,36 +405,84 @@ class CleanupApp(App):
             self.findings_data = json.load(f)
 
         # Sort by size descending
-        findings = sorted(
+        self.findings = sorted(
             self.findings_data["findings"],
             key=lambda x: x["size_bytes"],
             reverse=True
         )
 
-        # Populate list
-        findings_list = self.query_one("#findings-list", ListView)
-        for i, finding in enumerate(findings):
-            item = FindingItem(finding, i)
-            self.items.append(item)
-            findings_list.append(item)
+        # Initialize state for all items
+        for i, finding in enumerate(self.findings):
+            self.item_state[i] = {
+                "marked": False,
+                "snoozed": False,
+                "selected_action": finding.get("recommendation", "delete"),
+            }
 
+        # Populate visible list
+        self.refresh_list()
         self.update_status()
         self.update_details()
+        self.update_nav()
+
+    def update_nav(self) -> None:
+        """Update navigation bar to reflect current state."""
+        nav = self.query_one("#main-nav", Static)
+        skip_label = "[reverse]s Hide Skip[/]" if self.hide_skip else "s Hide Skip"
+        nav.update(
+            f"[bold magenta]↑↓[/] Navigate  "
+            f"[bold magenta]←→[/] Action  "
+            f"[bold magenta]space[/] Mark  "
+            f"[bold magenta]{skip_label}[/]  "
+            f"[bold magenta]z[/] Snooze  "
+            f"[bold magenta]i[/] Inspect  "
+            f"[bold magenta]^q[/] Quit  "
+            f"[bold rgb(0,255,0)]^x Execute[/]"
+        )
+
+    def refresh_list(self) -> None:
+        """Rebuild the list with only visible items."""
+        findings_list = self.query_one("#findings-list", ListView)
+        findings_list.clear()
+
+        has_items = False
+        # Create new widgets for visible items, restoring state
+        for i, finding in enumerate(self.findings):
+            should_hide = self.hide_skip and finding.get("recommendation") == "skip"
+            if should_hide:
+                continue
+
+            item = FindingItem(finding, i)
+            # Restore state
+            state = self.item_state[i]
+            item.marked = state["marked"]
+            item.snoozed = state["snoozed"]
+            item.selected_action = state["selected_action"]
+            findings_list.append(item)
+            has_items = True
+
+        # Select first item - track ourselves since children may not be populated yet
+        if has_items:
+            findings_list.index = 0
+            findings_list.refresh()
 
     def update_status(self) -> None:
-        total_count = len(self.findings_data["findings"])
-        total_gb = sum(f["size_bytes"] for f in self.findings_data["findings"]) / 1e9
-        marked_count = sum(1 for item in self.items if item.marked)
-        marked_gb = sum(item.finding["size_bytes"] / 1e9 for item in self.items if item.marked)
-        snoozed_count = sum(1 for item in self.items if item.snoozed)
+        total_count = len(self.findings)
+        total_gb = sum(f["size_bytes"] for f in self.findings) / 1e9
+        marked_count = sum(1 for s in self.item_state.values() if s["marked"])
+        marked_gb = sum(self.findings[i]["size_bytes"] / 1e9 for i, s in self.item_state.items() if s["marked"])
+        snoozed_count = sum(1 for s in self.item_state.values() if s["snoozed"])
+        skip_count = sum(1 for f in self.findings if f.get("recommendation") == "skip")
+        visible_count = total_count - skip_count if self.hide_skip else total_count
 
         status = self.query_one("#status-bar", Static)
         snoozed_part = f"  [dim]Snoozed:[/] [dim]{snoozed_count}[/]" if snoozed_count > 0 else ""
+        hidden_part = f"  [dim]Hidden:[/] [dim]{skip_count}[/]" if self.hide_skip else ""
         status.update(
             f"[bold magenta]DCC[/] [dim italic]Disk Cleanup Consultant[/]  "
-            f"[dim]Found:[/] [cyan]{total_count}[/] items ([cyan]{total_gb:.1f} GB[/])  "
+            f"[dim]Showing:[/] [cyan]{visible_count}[/] items ([cyan]{total_gb:.1f} GB[/])  "
             f"[dim]Selected:[/] [rgb(255,140,0)]{marked_count}[/] ([rgb(255,140,0)]{marked_gb:.1f} GB[/])"
-            f"{snoozed_part}"
+            f"{snoozed_part}{hidden_part}"
         )
 
     def update_details(self) -> None:
@@ -514,8 +556,10 @@ class CleanupApp(App):
 
     def on_resize(self, event) -> None:
         """Refresh all items when terminal is resized."""
-        for item in self.items:
-            item.update_display()
+        findings_list = self.query_one("#findings-list", ListView)
+        for child in findings_list.children:
+            if isinstance(child, FindingItem):
+                child.update_display()
 
     def on_key(self, event) -> None:
         """Handle key events directly for more reliable space handling."""
@@ -527,14 +571,28 @@ class CleanupApp(App):
     def action_toggle_mark(self) -> None:
         findings_list = self.query_one("#findings-list", ListView)
         if findings_list.highlighted_child and isinstance(findings_list.highlighted_child, FindingItem):
-            findings_list.highlighted_child.toggle_mark()
+            item = findings_list.highlighted_child
+            item.toggle_mark()
+            # Save state
+            self.item_state[item.index]["marked"] = item.marked
             self.update_status()
 
     def action_toggle_snooze(self) -> None:
         findings_list = self.query_one("#findings-list", ListView)
         if findings_list.highlighted_child and isinstance(findings_list.highlighted_child, FindingItem):
-            findings_list.highlighted_child.toggle_snooze()
+            item = findings_list.highlighted_child
+            item.toggle_snooze()
+            # Save state
+            self.item_state[item.index]["snoozed"] = item.snoozed
             self.update_status()
+
+    def action_toggle_hide_skip(self) -> None:
+        """Toggle hiding of items with 'skip' recommendation."""
+        self.hide_skip = not self.hide_skip
+        self.refresh_list()
+        self.update_nav()
+        self.update_status()
+        self.update_details()
 
     def _cycle_action(self, direction: int) -> None:
         """Cycle through actions for current item. direction: 1=next, -1=prev"""
@@ -553,6 +611,8 @@ class CleanupApp(App):
             # Cycle
             new_idx = (idx + direction) % len(opts)
             item.set_action(opts[new_idx]["id"])
+            # Save state
+            self.item_state[item.index]["selected_action"] = item.selected_action
             self.update_details()
 
     def action_prev_action(self) -> None:
@@ -572,7 +632,17 @@ class CleanupApp(App):
             subprocess.run(["open", "-R", str(path)], check=False)
 
     def action_execute(self) -> None:
-        marked = [item for item in self.items if item.marked]
+        # Build list of marked items from state
+        class MarkedItem:
+            def __init__(self, finding, selected_action):
+                self.finding = finding
+                self.selected_action = selected_action
+
+        marked = []
+        for i, state in self.item_state.items():
+            if state["marked"]:
+                marked.append(MarkedItem(self.findings[i], state["selected_action"]))
+
         if marked:
             self.push_screen(ConfirmScreen(marked))
 
