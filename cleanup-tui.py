@@ -26,7 +26,7 @@ ACTIONS = {
     "compress": "zip",
     "git-gc": "gc",
     "restore": "rst",
-    "skip": "---",
+    "skip": "skip",
 }
 
 
@@ -48,6 +48,7 @@ class FindingItem(ListItem):
         self.index = index
         self.selected_action = finding.get("recommendation", "delete")
         self.marked = False
+        self.snoozed = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="content")
@@ -74,20 +75,41 @@ class FindingItem(ListItem):
 
         # Build row content - use Rich Text object for reliable background
         # Use ASCII marker to avoid Unicode width issues
-        content = f" *  {size:>7} {cat:<6} {action:>3}  {days_str:>5}  {target}" if self.marked else f"    {size:>7} {cat:<6} {action:>3}  {days_str:>5}  {target}"
+        # Markers: * = marked, z = snoozed, space = normal
+        if self.marked:
+            marker = " * "
+        elif self.snoozed:
+            marker = " z "
+        else:
+            marker = "   "
+
+        content = f"{marker} {size:>7} {cat:<6} {action:<4}  {days_str:>5}  {target}"
 
         if self.marked:
             # Use Rich Text with style for reliable orange background
             styled = Text(content)
             styled.stylize("black on rgb(255,140,0)")
             self.query_one("#content", Static).update(styled)
+        elif self.snoozed:
+            # Snoozed: dim with strikethrough effect
+            styled = Text(content)
+            styled.stylize("dim strike")
+            self.query_one("#content", Static).update(styled)
         else:
             # Normal styling with markup - spacing must match marked format exactly
-            text = f"    [cyan]{size:>7}[/] {cat:<6} [yellow]{action:>3}[/]  [dim]{days_str:>5}[/]  {target}"
+            text = f"    [cyan]{size:>7}[/] {cat:<6} [yellow]{action:<4}[/]  [dim]{days_str:>5}[/]  {target}"
             self.query_one("#content", Static).update(text)
 
     def toggle_mark(self) -> None:
         self.marked = not self.marked
+        if self.marked:
+            self.snoozed = False  # Can't be both marked and snoozed
+        self.update_display()
+
+    def toggle_snooze(self) -> None:
+        self.snoozed = not self.snoozed
+        if self.snoozed:
+            self.marked = False  # Can't be both marked and snoozed
         self.update_display()
 
     def set_action(self, action: str) -> None:
@@ -352,9 +374,9 @@ class CleanupApp(App):
         Binding("left", "prev_action", "←", priority=True),
         Binding("right", "next_action", "→", priority=True),
         Binding("space", "toggle_mark", "Mark", priority=True),
+        Binding("s", "toggle_snooze", "Snooze"),
         Binding("i", "inspect", "Inspect"),
-        Binding("a", "mark_all", "All"),
-        Binding("n", "unmark_all", "None"),
+        Binding("ctrl+x", "execute", "Execute", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
     ]
 
@@ -371,15 +393,15 @@ class CleanupApp(App):
             yield ListView(id="findings-list")
             yield Static(id="details-panel")
 
-        # Custom nav bar - magenta/violet spectrum like Claude
+        # Custom nav bar - magenta/violet spectrum, execute highlighted on right
         yield Static(
             "[bold magenta]↑↓[/] Navigate  "
             "[bold magenta]←→[/] Action  "
             "[bold magenta]space[/] Mark  "
+            "[bold magenta]s[/] Snooze  "
             "[bold magenta]i[/] Inspect  "
-            "[bold magenta]a[/] All  "
-            "[bold magenta]n[/] None  "
-            "[bold magenta]^q[/] Quit",
+            "[bold magenta]^q[/] Quit  "
+            "[bold rgb(0,255,0)]^x Execute[/]",
             id="main-nav"
         )
 
@@ -410,12 +432,15 @@ class CleanupApp(App):
         total_gb = sum(f["size_bytes"] for f in self.findings_data["findings"]) / 1e9
         marked_count = sum(1 for item in self.items if item.marked)
         marked_gb = sum(item.finding["size_bytes"] / 1e9 for item in self.items if item.marked)
+        snoozed_count = sum(1 for item in self.items if item.snoozed)
 
         status = self.query_one("#status-bar", Static)
+        snoozed_part = f"  [dim]Snoozed:[/] [dim]{snoozed_count}[/]" if snoozed_count > 0 else ""
         status.update(
             f"[bold magenta]DCC[/] [dim italic]Disk Cleanup Consultant[/]  "
             f"[dim]Found:[/] [cyan]{total_count}[/] items ([cyan]{total_gb:.1f} GB[/])  "
             f"[dim]Selected:[/] [rgb(255,140,0)]{marked_count}[/] ([rgb(255,140,0)]{marked_gb:.1f} GB[/])"
+            f"{snoozed_part}"
         )
 
     def update_details(self) -> None:
@@ -460,16 +485,21 @@ class CleanupApp(App):
                 reversible = "rev" if opt.get("reversible") else "perm"
                 is_selected = opt_id == action
                 is_rec = opt_id == f.get("recommendation")
-                rec_mark = "*" if is_rec else ""
 
                 if is_selected:
-                    action_parts.append(f"[bold yellow]▶ {opt_name}[/] [dim]({reclaim_gb:.1f}GB {reversible})[/]")
+                    rec_label = " [green](recommended)[/]" if is_rec else ""
+                    action_parts.append(f"[bold yellow]◀ {opt_name} ▶[/] [dim]({reclaim_gb:.1f}GB {reversible})[/]{rec_label}")
                 else:
-                    action_parts.append(f"[dim]{opt_name}{rec_mark}[/]")
+                    action_parts.append(f"[dim]{opt_name}[/]")
             line4 = "  ".join(action_parts)
 
-            # Line 5: Restore info
-            line5 = f"[dim]Restore:[/] [italic]{f.get('reason', 'N/A')}[/]"
+            # Line 5: Context-appropriate label
+            recommendation = f.get("recommendation", "delete")
+            reason = f.get("reason", "N/A")
+            if recommendation == "skip":
+                line5 = f"[dim]Why skip:[/] [italic]{reason}[/]"
+            else:
+                line5 = f"[dim]Restore:[/] [italic]{reason}[/]"
 
             lines = [line1, line2]
             if line3:
@@ -498,6 +528,12 @@ class CleanupApp(App):
         findings_list = self.query_one("#findings-list", ListView)
         if findings_list.highlighted_child and isinstance(findings_list.highlighted_child, FindingItem):
             findings_list.highlighted_child.toggle_mark()
+            self.update_status()
+
+    def action_toggle_snooze(self) -> None:
+        findings_list = self.query_one("#findings-list", ListView)
+        if findings_list.highlighted_child and isinstance(findings_list.highlighted_child, FindingItem):
+            findings_list.highlighted_child.toggle_snooze()
             self.update_status()
 
     def _cycle_action(self, direction: int) -> None:
@@ -534,18 +570,6 @@ class CleanupApp(App):
             path = Path(target).expanduser()
             # Use open -R to reveal in Finder (works for files and directories)
             subprocess.run(["open", "-R", str(path)], check=False)
-
-    def action_mark_all(self) -> None:
-        for item in self.items:
-            item.marked = True
-            item.update_display()
-        self.update_status()
-
-    def action_unmark_all(self) -> None:
-        for item in self.items:
-            item.marked = False
-            item.update_display()
-        self.update_status()
 
     def action_execute(self) -> None:
         marked = [item for item in self.items if item.marked]

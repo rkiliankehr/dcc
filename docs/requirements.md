@@ -1,11 +1,30 @@
-# Disk Cleanup System - Requirements Draft
+# DCC - Disk Cleanup Consultant
+
+## Implementation Status
+
+**Implemented:**
+- Interactive TUI (`dcc`) with Textual framework
+- Finding visualization with size, category, action, staleness
+- Keyboard navigation (↑↓ navigate, ←→ cycle actions, space mark)
+- Details panel with action cycling
+- Inspect function (reveal in Finder)
+- Confirmation screen
+
+**Not yet implemented:**
+- Analyzer daemon (`dcc-analyze`)
+- Actual action execution (delete, compress, git-gc)
+- Compression with rollback scripts
+- Snooze mechanism
+- Configuration file
+- launchd scheduling
+- macOS notifications
 
 ## Overview
 
 A two-part system for identifying and executing disk space optimization:
 
-1. **Analyzer** (`cleanup-analyze`) - Scheduled daemon that scans and produces structured recommendations
-2. **Interactive CLI** (`cleanup`) - Textual TUI to review, select, and execute actions
+1. **Analyzer** (`dcc-analyze`) - Scheduled daemon that scans and produces structured recommendations (not yet implemented)
+2. **Interactive CLI** (`dcc`) - Textual TUI to review, select, and execute actions
 
 ## Goals
 
@@ -56,7 +75,7 @@ Each finding produces a structured record with all decision-relevant data:
       reclaim_bytes: 4521897234
       reversible: false
     - id: compress
-      action: "cleanup-compress '~/ws/old-project/node_modules'"
+      action: "dcc-compress '~/ws/old-project/node_modules'"
       reclaim_bytes: 3800000000  # estimated ~85% for node_modules
       reversible: true
 
@@ -98,14 +117,31 @@ Previously archived items (`.archived.zip` files) remain candidates for future c
 
 ### Action Types
 
-| Action | Reversible | Description |
-|--------|------------|-------------|
-| `delete` | No | Remove target permanently |
-| `compress` | Yes | Zip with rollback script |
-| `git-gc` | No | Run `git gc --aggressive` |
-| `git-prune` | No | Prune unreachable objects |
-| `truncate` | No | Truncate log file to 0 |
-| `rotate` | Partial | Archive and truncate log |
+Actions displayed as lowercase verbs:
+
+- `del` - Delete permanently (irreversible)
+- `zip` - Compress with rollback script (reversible)
+- `gc` - Run `git gc --aggressive` (irreversible)
+- `rst` - Restore from archive (reversible)
+- `---` - Skip / no action
+
+### Category Labels
+
+Categories displayed as readable labels (not abbreviations):
+
+- `App` - Applications
+- `Node` - Node.js (node_modules)
+- `Rust` - Rust (target/)
+- `Venv` - Python virtual environments
+- `Model` - LLM models (Ollama, etc.)
+- `Cache` - System/app caches
+- `Logs` - Log files
+- `Git` - Git repositories
+- `Backup` - Backup files
+- `Archiv` - Previously archived items
+- `Orphan` - Leftover files from uninstalled apps
+- `File` - Generic large files
+- `Data` - Data directories (ML checkpoints, etc.)
 
 ### Compression with Rollback
 
@@ -161,7 +197,7 @@ echo "Restored: node_modules"
 
 ---
 
-## Interactive CLI (`cleanup`)
+## Interactive CLI (`dcc`)
 
 **Framework:** Python Textual TUI (full terminal control, proper keyboard navigation)
 
@@ -169,62 +205,58 @@ echo "Restored: node_modules"
 
 ```
 ╭─────────────────────────────────────────────────────────────────────╮
-│ Cleanup 54.0GB │ 3 sel (12.2GB)                              q quit │
+│ DCC Disk Cleanup Consultant │ 47.3 GB reclaimable │ 0 marked (0 B)  │
 ├─────────────────────────────────────────────────────────────────────┤
-│ ✓ 12.1GB 📦 Del  227d /Applications/Xcode.app                       │
-│   5.0GB 📊 Zip   81d ~/ws/ml-experiments/checkpoints                │
-│   4.8GB 📄 Del  147d ~/Downloads/ubuntu-24.04-desktop-amd64.iso     │
-│ ✓ 4.2GB 📗 Del  152d ~/ws/old-project/node_modules                  │
+│   12.1GB App    del 227d /Applications/Xcode.app                    │
+│    5.0GB Data   zip  81d ~/ws/ml-experiments/checkpoints            │
+│    4.8GB File   del 147d ~/Downloads/ubuntu-24.04-desktop-amd64.iso │
+│ *  4.2GB Node   del 152d ~/ws/old-project/node_modules              │
 ├─────────────────────────────────────────────────────────────────────┤
-│ /Applications/Xcode.app                                             │
-│ 12.1 GB • app • 227d stale • 284,523 files • mod:2025-05-15         │
-│ Actions: delete  Restore: App Store reinstall                       │
+│ ~/ws/old-project/node_modules                                       │
+│ 4.2 GB · Node · 152d stale · npm install                            │
+│ ◀ del ▶  zip                                                        │
 ╰─────────────────────────────────────────────────────────────────────╯
+  ↑↓ navigate  ←→ action  space mark  i inspect  x execute  q quit
 ```
 
 ### List Item Format (Single Line)
 
 ```
-✓ 12.1GB 📦 Del  227d ~/Applications/Xcode.app
-│ │      │  │    │    └─ Target path
-│ │      │  │    └─ Staleness (days)
-│ │      │  └─ Action: Del/Zip/GC
-│ │      └─ Category icon
-│ └─ Size
-└─ Selection mark (✓ = marked)
+*  4.2GB Node   del 152d ~/ws/old-project/node_modules
+│  │     │      │   │    └─ Target path (truncated if needed)
+│  │     │      │   └─ Staleness (days since last access)
+│  │     │      └─ Action: del/zip/gc/rst/---
+│  │     └─ Category label (App, Node, Rust, Venv, Model, etc.)
+│  └─ Size (human-readable)
+└─ Mark indicator (* = marked, space = unmarked)
 ```
 
 ### Keyboard Navigation
 
-**Main List:**
+**Main View (single screen, no drill-down):**
 
 - `↑/↓` - Navigate items (sorted by size, biggest first)
-- `SPACE` - Mark/unmark item for action
-- `ENTER` or `→` - Drill into item to select action
+- `←/→` - Cycle through available actions for current item
+- `SPACE` - Mark/unmark item for execution
+- `i` - Inspect: reveal target in Finder
 - `a` - Mark all items
 - `n` - Clear all marks
 - `x` - Execute marked items → confirmation screen
 - `q` - Quit
 
-**Action Selector (drill-down):**
-
-- `↑/↓` - Navigate available actions
-- `SPACE` or `ENTER` - Select action, return to list
-- `ESC` or `←` - Cancel, return to list
-
 **Confirmation Screen:**
 
-- `y` - Execute all
-- `n` or `ESC` - Cancel
-- `e` - Edit, return to list
+- `y` - Execute all marked actions
+- `n` or `ESC` - Cancel, return to main view
 
-### Colors (Terminal-Safe)
+### Colors
 
-- **Cyan** - Highlights, target paths
-- **Green** - Selected/marked, positive
-- **Yellow** - Action type, warnings
+- **Cyan** - Current row highlight (cursor position)
+- **Orange** - Marked items (background highlight)
+- **Magenta spectrum** - Navigation bar, action indicators
+- **Rainbow** - Details panel labels (visual interest)
 - **Dim** - Secondary info
-- ~~Blue~~ - Not used (poor readability)
+- ~~Blue~~ - Avoided (poor readability on dark terminals)
 
 ### Confirmation Screen
 
@@ -425,9 +457,9 @@ Identify potential duplicates:
 
 ---
 
-## Configuration
+## Configuration (not yet implemented)
 
-Location: `~/.config/cleanup-analyzer/config.yaml`
+Location: `~/.config/dcc/config.yaml`
 
 ```yaml
 # Scanning
@@ -457,7 +489,7 @@ git_gc_threshold_mb: 100
 git_stale_remote_days: 60
 
 # Output
-output_dir: ~/.local/share/cleanup-analyzer
+output_dir: ~/.local/share/dcc
 output_format: markdown  # or json, html
 keep_reports: 30  # days
 
@@ -468,7 +500,7 @@ notify_threshold_gb: 5  # minimum savings to trigger notification
 
 # Snooze
 snooze_days: 14  # re-surface dismissed items after this period
-snooze_file: ~/.local/share/cleanup-analyzer/snoozed.yaml
+snooze_file: ~/.local/share/dcc/snoozed.yaml
 
 # Compression
 compress_level: 9  # max compression
@@ -484,9 +516,9 @@ show_reversible_first: false  # or prioritize by size
 
 ## Output Format
 
-### Analyzer Output
+### Analyzer Output (not yet implemented)
 
-Primary output: `~/.local/share/cleanup-analyzer/findings.yaml`
+Primary output: `~/.local/share/dcc/findings.json`
 
 ```yaml
 generated: 2026-01-14T12:00:00
@@ -506,7 +538,7 @@ findings:
         reclaim_bytes: 4521897234
         reversible: false
       - id: compress
-        action: "cleanup-compress '~/ws/old-project/node_modules'"
+        action: "dcc-compress '~/ws/old-project/node_modules'"
         reclaim_bytes: 3800000000
         reversible: true
     recommendation: delete
@@ -514,9 +546,9 @@ findings:
   # ... more findings
 ```
 
-### Human-Readable Report (optional)
+### Human-Readable Report (optional, not yet implemented)
 
-Also generates `~/.local/share/cleanup-analyzer/report.md` for quick review without interactive CLI.
+Also generates `~/.local/share/dcc/report.md` for quick review without interactive CLI.
 
 ---
 
@@ -524,21 +556,19 @@ Also generates `~/.local/share/cleanup-analyzer/report.md` for quick review with
 
 ### Components
 
-| Command | Purpose | Invocation |
-|---------|---------|------------|
-| `cleanup-analyze` | Scan and produce findings.yaml | Scheduled (launchd) |
-| `cleanup` | Interactive review and execute | Manual |
-| `cleanup-compress` | Compress with rollback script | Called by cleanup |
-| `cleanup snooze <path>` | Snooze a recommendation | Manual |
+- `dcc-analyze` - Scan and produce findings.json (scheduled via launchd) - **not yet implemented**
+- `dcc` - Interactive TUI to review and execute actions (manual)
+- `dcc-compress` - Compress with rollback script (called by dcc) - **not yet implemented**
+- `dcc snooze <path>` - Snooze a recommendation (manual) - **not yet implemented**
 
-### launchd plist
+### launchd plist (not yet implemented)
 
-Location: `~/Library/LaunchAgents/com.user.archived-analyzer.plist`
+Location: `~/Library/LaunchAgents/com.user.dcc-analyzer.plist`
 
 - Run daily at 12:00 (noon)
 - Run on wake if missed (StartCalendarInterval + launchd catch-up)
 - Low priority (nice)
-- Log output to `~/.local/share/cleanup-analyzer/logs/`
+- Log output to `~/.local/share/dcc/logs/`
 - Send macOS notification on completion if savings > threshold
 
 ---
@@ -562,9 +592,9 @@ Location: `~/Library/LaunchAgents/com.user.archived-analyzer.plist`
 - Warn before suggesting deletion of anything with recent access
 - Flag items with unpushed git changes
 
-### Snooze Mechanism
-- User can snooze individual recommendations via: `cleanup snooze <path>`
-- Snoozed items stored with timestamp in `~/.local/share/cleanup-analyzer/snoozed.yaml`
+### Snooze Mechanism (not yet implemented)
+- User can snooze individual recommendations via: `dcc snooze <path>`
+- Snoozed items stored with timestamp in `~/.local/share/dcc/snoozed.yaml`
 - Items re-appear after `snooze_days` (default: 14)
 - No permanent ignore - everything resurfaces eventually
 - Snooze file format:
