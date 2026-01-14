@@ -9,12 +9,12 @@
 ├── findings.json      # Latest analyzer scan results (read by TUI)
 ├── snoozed.json       # User-snoozed items with expiry dates
 └── logs/              # Analyzer run logs (optional)
-    └── dcc-analyze-2026-01-14.log
+    └── dcc-scout-2026-01-14.log
 ```
 
 ### findings.json
 
-Produced by `dcc-analyze`, consumed by `dcc` TUI.
+Produced by `dcc-scout`, consumed by `dcc` TUI.
 
 ```json
 {
@@ -46,7 +46,7 @@ Produced by `dcc-analyze`, consumed by `dcc` TUI.
 ```
 
 **Lifecycle:**
-1. `dcc-analyze` scans filesystem, writes findings.json
+1. `dcc-scout` scans filesystem, writes findings.json
 2. `dcc` TUI reads findings.json on startup
 3. TUI filters out items present in snoozed.json (unless expired)
 4. User reviews, marks, executes actions
@@ -120,13 +120,13 @@ Managed by TUI when user presses 's' to snooze. Read by both analyzer and TUI.
 
 ### P1 - Analyzer
 
-- [ ] **dcc-analyze: Basic scanner**
+- [ ] **dcc-scout: Basic scanner**
   - Scan home directory for large files (>1GB)
   - Detect stale node_modules, target/, venv/
   - Output findings.json to ~/.dcc/
   - Respect snoozed.json (exclude snoozed items)
 
-- [ ] **dcc-analyze: Build artifact detection**
+- [ ] **dcc-scout: Build artifact detection**
   - Python: venv/, .venv/, __pycache__/, .pytest_cache/
   - Node.js: node_modules/, .npm/, .yarn/
   - Rust: target/
@@ -136,32 +136,32 @@ Managed by TUI when user presses 's' to snooze. Read by both analyzer and TUI.
   - iOS/macOS: DerivedData/, Pods/, .build/
   - General: dist/, build/, out/, coverage/
 
-- [ ] **dcc-analyze: Staleness calculation**
+- [ ] **dcc-scout: Staleness calculation**
   - Use project marker (package.json, Cargo.toml, etc.) mtime
   - Default threshold: 30 days
   - Calculate staleness_days for each finding
 
-- [ ] **dcc-analyze: Git repository analysis**
+- [ ] **dcc-scout: Git repository analysis**
   - Detect repos with many loose objects (`git count-objects -v`)
   - Calculate potential gc savings
   - Warn if unpushed changes exist
 
-- [ ] **dcc-analyze: Application analysis**
+- [ ] **dcc-scout: Application analysis**
   - Scan /Applications and ~/Applications
   - Get last used date via `mdls -name kMDItemLastUsedDate`
   - Flag apps >1GB not used in 90+ days
 
-- [ ] **dcc-analyze: Library leftovers**
+- [ ] **dcc-scout: Library leftovers**
   - Scan ~/Library/Application Support/
   - Match against installed apps
   - Flag orphaned support directories
 
-- [ ] **dcc-analyze: Cache directories**
+- [ ] **dcc-scout: Cache directories**
   - ~/Library/Caches/
   - Report total size per app
   - Flag stale caches
 
-- [ ] **dcc-analyze: Log file detection**
+- [ ] **dcc-scout: Log file detection**
   - Find *.log files >100MB
   - Check if actively written (lsof)
   - Suggest truncate/rotate/delete
@@ -169,7 +169,7 @@ Managed by TUI when user presses 's' to snooze. Read by both analyzer and TUI.
 ### P2 - Scheduling & Notifications
 
 - [ ] **launchd plist for daily runs**
-  - ~/Library/LaunchAgents/com.user.dcc-analyzer.plist
+  - ~/Library/LaunchAgents/com.user.dcc-scout.plist
   - Run daily at 12:00 (noon)
   - Low priority (nice)
   - Log to ~/.dcc/logs/

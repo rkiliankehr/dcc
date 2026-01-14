@@ -11,7 +11,7 @@
 - Confirmation screen
 
 **Not yet implemented:**
-- Analyzer daemon (`dcc-analyze`)
+- Analyzer daemon (`dcc-scout`)
 - Actual action execution (delete, compress, git-gc)
 - Compression with rollback scripts
 - Snooze mechanism
@@ -23,7 +23,7 @@
 
 A two-part system for identifying and executing disk space optimization:
 
-1. **Analyzer** (`dcc-analyze`) - Scheduled daemon that scans and produces structured recommendations (not yet implemented)
+1. **Analyzer** (`dcc-scout`) - Scheduled daemon that scans and produces structured recommendations (not yet implemented)
 2. **Interactive CLI** (`dcc`) - Textual TUI to review, select, and execute actions
 
 ## Goals
@@ -556,14 +556,14 @@ Also generates `~/.local/share/dcc/report.md` for quick review without interacti
 
 ### Components
 
-- `dcc-analyze` - Scan and produce findings.json (scheduled via launchd) - **not yet implemented**
+- `dcc-scout` - Scan and produce findings.json (scheduled via launchd) - **not yet implemented**
 - `dcc` - Interactive TUI to review and execute actions (manual)
 - `dcc-compress` - Compress with rollback script (called by dcc) - **not yet implemented**
 - `dcc snooze <path>` - Snooze a recommendation (manual) - **not yet implemented**
 
 ### launchd plist (not yet implemented)
 
-Location: `~/Library/LaunchAgents/com.user.dcc-analyzer.plist`
+Location: `~/Library/LaunchAgents/com.user.dcc-scout.plist`
 
 - Run daily at 12:00 (noon)
 - Run on wake if missed (StartCalendarInterval + launchd catch-up)
