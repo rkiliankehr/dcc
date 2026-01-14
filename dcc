@@ -1,0 +1,4 @@
+#!/bin/bash
+# DCC - Disk Cleanup Consultant
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/cleanup-tui.py" "${@:-$SCRIPT_DIR/test/sample-findings.json}"
