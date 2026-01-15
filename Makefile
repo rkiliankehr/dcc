@@ -3,7 +3,7 @@
 
 PREFIX ?= $(HOME)/bin
 DCC_HOME := $(shell pwd)
-CRON_SCHEDULE ?= 0 9 * * *
+CRON_SCHEDULE ?= 0 9,12,15 * * *
 
 .PHONY: install uninstall cron-install cron-uninstall help
 
@@ -13,13 +13,13 @@ help:
 	@echo "Targets:"
 	@echo "  install        Install dcc to ~/bin"
 	@echo "  uninstall      Remove dcc from ~/bin"
-	@echo "  cron-install   Add daily scan cron job (9am)"
+	@echo "  cron-install   Add scan cron job (9am, 12pm, 3pm)"
 	@echo "  cron-uninstall Remove cron job"
 	@echo "  all            Install + cron"
 	@echo ""
 	@echo "Variables:"
 	@echo "  PREFIX         Install location (default: ~/bin)"
-	@echo "  CRON_SCHEDULE  Cron schedule (default: 0 9 * * *)"
+	@echo "  CRON_SCHEDULE  Cron schedule (default: 0 9,12,15 * * *)"
 
 install:
 	@mkdir -p $(PREFIX)
