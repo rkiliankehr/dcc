@@ -3,28 +3,42 @@
 ## Implementation Status
 
 **Implemented:**
-- Interactive TUI (`dcc`) with Textual framework
+- Scanner (`dcc-scout`) with multiple detection phases
+- Interactive TUI (`cleanup-tui.py`) with Textual framework
+- CLI wrapper (`dcc`) with auto-scan if stale
 - Finding visualization with size, category, action, staleness
-- Keyboard navigation (↑↓ navigate, ←→ cycle actions, space mark)
+- Keyboard navigation (↑↓ navigate, ←→ cycle actions, space mark, z snooze)
 - Details panel with action cycling
 - Inspect function (reveal in Finder)
-- Confirmation screen
+- Confirmation screen with actual shell commands
+- Action execution (delete, git-gc, ollama-rm, hf-delete)
+- Snooze persistence (~/.dcc/snoozed.json, 14-day expiration)
+- Cleaned items detection (hides already-deleted items on startup)
+- Cron scheduling via Makefile
+
+**Detection phases (dcc-scout):**
+- Large files (>1GB)
+- Build artifacts (node_modules, target/, venv/, etc.)
+- Git repositories (gc candidates)
+- Applications (unused >90 days)
+- Library leftovers (orphaned support dirs)
+- Cache directories
+- Ollama models
+- Huggingface models
 
 **Not yet implemented:**
-- Analyzer daemon (`dcc-scout`)
-- Actual action execution (delete, compress, git-gc)
-- Compression with rollback scripts
-- Snooze mechanism
+- Compression with rollback scripts (zip action)
+- Log file detection
 - Configuration file
-- launchd scheduling
 - macOS notifications
 
 ## Overview
 
 A two-part system for identifying and executing disk space optimization:
 
-1. **Analyzer** (`dcc-scout`) - Scheduled daemon that scans and produces structured recommendations (not yet implemented)
-2. **Interactive CLI** (`dcc`) - Textual TUI to review, select, and execute actions
+1. **Scanner** (`dcc-scout`) - Scans filesystem and produces structured recommendations
+2. **Interactive TUI** (`cleanup-tui.py`) - Review, select, and execute cleanup actions
+3. **CLI Wrapper** (`dcc`) - Entry point with auto-scan if data is stale
 
 ## Goals
 
@@ -120,20 +134,22 @@ Previously archived items (`.archived.zip` files) remain candidates for future c
 Actions displayed as lowercase verbs:
 
 - `del` - Delete permanently (irreversible)
-- `zip` - Compress with rollback script (reversible)
+- `zip` - Compress with rollback script (reversible) - not yet implemented
 - `gc` - Run `git gc --aggressive` (irreversible)
-- `rst` - Restore from archive (reversible)
-- `---` - Skip / no action
+- `rm` - Remove ollama model via `ollama rm`
+- `rst` - Restore from archive (reversible) - not yet implemented
+- `skip` - Skip / no action
 
 ### Category Labels
 
-Categories displayed as readable labels (not abbreviations):
+Categories displayed as readable labels:
 
 - `App` - Applications
 - `Node` - Node.js (node_modules)
 - `Rust` - Rust (target/)
 - `Venv` - Python virtual environments
-- `Model` - LLM models (Ollama, etc.)
+- `Ollama` - Ollama models
+- `HF` - Huggingface models
 - `Cache` - System/app caches
 - `Logs` - Log files
 - `Git` - Git repositories
@@ -141,7 +157,11 @@ Categories displayed as readable labels (not abbreviations):
 - `Archiv` - Previously archived items
 - `Orphan` - Leftover files from uninstalled apps
 - `File` - Generic large files
-- `Data` - Data directories (ML checkpoints, etc.)
+- `Data` - Data directories
+- `.NET` - .NET artifacts
+- `Java` - Java/Gradle artifacts
+- `Go` - Go artifacts
+- `Swift` - Swift/iOS artifacts
 
 ### Compression with Rollback
 
@@ -233,21 +253,21 @@ echo "Restored: node_modules"
 
 ### Keyboard Navigation
 
-**Main View (single screen, no drill-down):**
+**Main View:**
 
 - `↑/↓` - Navigate items (sorted by size, biggest first)
 - `←/→` - Cycle through available actions for current item
 - `SPACE` - Mark/unmark item for execution
+- `z` - Toggle snooze (hides item for 14 days)
+- `s` - Toggle hide/show items with "skip" recommendation
 - `i` - Inspect: reveal target in Finder
-- `a` - Mark all items
-- `n` - Clear all marks
-- `x` - Execute marked items → confirmation screen
-- `q` - Quit
+- `Ctrl+X` - Execute marked items → confirmation screen
+- `Ctrl+Q` - Quit
 
 **Confirmation Screen:**
 
-- `y` - Execute all marked actions
-- `n` or `ESC` - Cancel, return to main view
+- `Ctrl+Y` - Execute all marked actions
+- `ESC` - Cancel, return to main view
 
 ### Colors
 
@@ -552,24 +572,27 @@ Also generates `~/.local/share/dcc/report.md` for quick review without interacti
 
 ---
 
-## Scheduling & Components
+## Installation & Scheduling
 
 ### Components
 
-- `dcc-scout` - Scan and produce findings.json (scheduled via launchd) - **not yet implemented**
-- `dcc` - Interactive TUI to review and execute actions (manual)
-- `dcc-compress` - Compress with rollback script (called by dcc) - **not yet implemented**
-- `dcc snooze <path>` - Snooze a recommendation (manual) - **not yet implemented**
+- `dcc-scout.py` - Scanner that produces ~/.dcc/scan.json
+- `cleanup-tui.py` - Interactive TUI to review and execute actions
+- `dcc` - CLI wrapper (auto-scans if data >24h old)
 
-### launchd plist (not yet implemented)
+### Installation
 
-Location: `~/Library/LaunchAgents/com.user.dcc-scout.plist`
+```bash
+make install        # Symlink dcc to ~/bin
+make cron-install   # Add daily scan cron job (9am)
+make all            # Both
+```
 
-- Run daily at 12:00 (noon)
-- Run on wake if missed (StartCalendarInterval + launchd catch-up)
-- Low priority (nice)
-- Log output to `~/.local/share/dcc/logs/`
-- Send macOS notification on completion if savings > threshold
+### Cron Job
+
+Installed via `make cron-install`:
+- Runs `dcc scan` daily at 9am
+- Keeps scan data fresh for interactive use
 
 ---
 
@@ -592,18 +615,13 @@ Location: `~/Library/LaunchAgents/com.user.dcc-scout.plist`
 - Warn before suggesting deletion of anything with recent access
 - Flag items with unpushed git changes
 
-### Snooze Mechanism (not yet implemented)
-- User can snooze individual recommendations via: `dcc snooze <path>`
-- Snoozed items stored with timestamp in `~/.local/share/dcc/snoozed.yaml`
-- Items re-appear after `snooze_days` (default: 14)
+### Snooze Mechanism
+- User toggles snooze with `z` key in TUI
+- Snoozed items stored in `~/.dcc/snoozed.json`
+- Items re-appear after 14 days
+- Saved on `Ctrl+X` (not immediately on toggle)
+- Snoozed items hidden from list on startup
 - No permanent ignore - everything resurfaces eventually
-- Snooze file format:
-  ```yaml
-  snoozed:
-    - path: ~/ws/old-project/node_modules
-      until: 2026-01-28
-      reason: "keeping for reference"  # optional
-  ```
 
 ### Compression Rollback Design
 - Archive and restore script placed **inside parent directory** (preserves ccd navigation)
