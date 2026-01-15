@@ -86,6 +86,14 @@ MODEL_DIRS = [
     ("~/.cache/torch", "model"),
 ]
 
+# Default exclusions for fd-based scanning (heavy directories to skip)
+FD_EXCLUSIONS = [
+    "node_modules", ".git", "Library", ".venv", "venv", "target",
+    ".npm", ".cargo", ".rustup", "Pods", "DerivedData",
+    ".Trash", "CloudStorage", "Mobile Documents", ".ollama",
+    ".cache/huggingface", ".lima", ".colima", ".docker", ".orbstack",
+]
+
 
 class DccScout:
     def __init__(self, config_path: Optional[Path] = None, dcc_dir: Optional[Path] = None):
@@ -226,6 +234,99 @@ class DccScout:
             pass
         return total_size, file_count
 
+    def _has_fd(self) -> bool:
+        """Check if fd (fast find) is available."""
+        if not hasattr(self, "_fd_available"):
+            result = subprocess.run(["which", "fd"], capture_output=True)
+            self._fd_available = result.returncode == 0
+            if not self._fd_available:
+                print("Warning: fd not found. Install with 'brew install fd' for faster scanning.")
+        return self._fd_available
+
+    def _fd_find(
+        self,
+        pattern: str,
+        path: Path,
+        type_filter: str = None,
+        size_filter: str = None,
+        exclude_dirs: list = None,
+        extra_args: list = None,
+    ) -> list[Path]:
+        """Use fd for fast file discovery.
+
+        Args:
+            pattern: Regex pattern to match (use "." for all files)
+            path: Root path to search
+            type_filter: "f" for files, "d" for directories
+            size_filter: Size filter like "+1g" (>1GB) or "+100m" (>100MB)
+            exclude_dirs: List of directory names to exclude
+            extra_args: Additional fd arguments
+
+        Returns:
+            List of Path objects matching the criteria
+        """
+        cmd = ["fd", "--hidden", "--no-ignore", "--absolute-path"]
+
+        if type_filter:
+            cmd.extend(["--type", type_filter])
+        if size_filter:
+            cmd.extend(["--size", size_filter])
+
+        # Apply exclusions
+        for excl in (exclude_dirs or FD_EXCLUSIONS):
+            cmd.extend(["--exclude", excl])
+
+        if extra_args:
+            cmd.extend(extra_args)
+
+        cmd.extend([pattern, str(path)])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                return []
+            lines = result.stdout.strip().split("\n")
+            return [Path(p) for p in lines if p]
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return []
+
+    def _get_dir_size_fast(self, path: Path) -> tuple[int, int]:
+        """Get directory size using du (faster than Python rglob).
+
+        Returns (size_bytes, file_count).
+        """
+        try:
+            # Use du -sk for size in KB
+            result = subprocess.run(
+                ["du", "-sk", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode == 0:
+                size_kb = int(result.stdout.split()[0])
+                size_bytes = size_kb * 1024
+
+                # Get file count with fd (fast)
+                if self._has_fd():
+                    count_result = subprocess.run(
+                        ["fd", "--type", "f", ".", str(path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    file_count = len(count_result.stdout.strip().split("\n")) if count_result.stdout.strip() else 0
+                else:
+                    # Fallback: estimate from du output
+                    file_count = 0
+
+                return size_bytes, file_count
+        except (subprocess.TimeoutExpired, ValueError, IndexError):
+            pass
+
+        # Fallback to slow Python method
+        return self._get_dir_size(path)
+
     def _save_phase_result(self, phase: str, findings: list):
         """Save intermediate phase results."""
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -286,33 +387,46 @@ class DccScout:
         """Find files larger than threshold."""
         print("Scanning for large files...")
         findings = []
-        min_bytes = self.config["thresholds"]["large_file_min_gb"] * 1e9
+        min_gb = self.config["thresholds"]["large_file_min_gb"]
+        min_bytes = min_gb * 1e9
 
         for scan_path in self.config["scan_paths"]:
             root = Path(scan_path).expanduser()
             if not root.exists():
                 continue
 
-            for path in root.rglob("*"):
-                if not path.is_file():
-                    continue
+            # Use fd for fast file discovery if available
+            if self._has_fd():
+                # fd size filter: +1g means >1GB
+                size_filter = f"+{min_gb}g"
+                # For large files, we want to scan Library too (for email DBs, models, etc.)
+                # Only exclude directories handled by other phases
+                large_file_exclusions = [
+                    ".git", ".ollama", ".cache/huggingface",  # handled by other phases
+                    "node_modules", ".venv", "venv", "target",  # build artifacts
+                    ".Trash", "CloudStorage", "Mobile Documents",  # cloud/trash
+                ]
+                large_files = self._fd_find(
+                    ".",
+                    root,
+                    type_filter="f",
+                    size_filter=size_filter,
+                    exclude_dirs=large_file_exclusions,
+                )
+            else:
+                # Fallback to slow rglob
+                large_files = [
+                    p for p in root.rglob("*")
+                    if p.is_file() and p.stat().st_size >= min_bytes
+                ]
+
+            for path in large_files:
                 if self._is_excluded(path):
-                    continue
-                # Skip files inside .git directories (handled by git-gc phase)
-                if ".git" in path.parts:
-                    continue
-                # Skip ollama blobs (handled by ollama_models phase)
-                if ".ollama" in path.parts and "blobs" in path.parts:
-                    continue
-                # Skip huggingface cache (handled by huggingface_models phase)
-                if "huggingface" in path.parts and "hub" in path.parts:
                     continue
 
                 try:
                     stat = path.stat()
                     apparent_size = stat.st_size
-                    if apparent_size < min_bytes:
-                        continue
 
                     # Use actual disk usage, not apparent size
                     size = stat.st_blocks * 512
@@ -389,26 +503,73 @@ class DccScout:
         findings = []
         stale_days = self.config["thresholds"]["stale_days"]
 
+        # Build marker lookup: filename -> [(artifact_dirs, category, restore_hint), ...]
+        marker_lookup = {}
+        for marker, artifact_dirs, category, restore_hint in BUILD_ARTIFACTS:
+            marker_lookup.setdefault(marker, []).append((artifact_dirs, category, restore_hint))
+
         for scan_path in self.config["scan_paths"]:
             root = Path(scan_path).expanduser()
             if not root.exists():
                 continue
 
-            # Find project directories by marker files
-            for marker, artifact_dirs, category, restore_hint in BUILD_ARTIFACTS:
-                if "*" in marker:
-                    # Glob pattern
-                    marker_files = list(root.rglob(marker))
+            # Find all marker files in one pass using fd
+            if self._has_fd():
+                # Build regex pattern for all markers (escape dots for regex)
+                # Handle glob patterns like *.csproj specially
+                exact_markers = [m for m in marker_lookup.keys() if "*" not in m]
+                glob_markers = [m for m in marker_lookup.keys() if "*" in m]
+
+                marker_pattern = "|".join(
+                    f"^{m.replace('.', r'\.')}$" for m in exact_markers
+                )
+                # Add glob patterns (*.csproj -> \.csproj$)
+                for gm in glob_markers:
+                    ext = gm.replace("*", "")
+                    marker_pattern += f"|{ext.replace('.', r'\.')}$"
+
+                # Use reduced exclusions - we want to find markers in more places
+                # but still skip the heaviest directories
+                marker_exclusions = ["Library", ".Trash", "CloudStorage", "Mobile Documents"]
+                marker_files = self._fd_find(
+                    marker_pattern,
+                    root,
+                    type_filter="f",
+                    exclude_dirs=marker_exclusions,
+                )
+            else:
+                # Fallback: find markers one by one (slow)
+                marker_files = []
+                for marker in marker_lookup.keys():
+                    marker_files.extend(root.rglob(marker))
+
+            # Process found markers
+            for marker_path in marker_files:
+                if self._is_excluded(marker_path):
+                    continue
+
+                # Find which marker this matches
+                marker_name = marker_path.name
+                matched_configs = []
+
+                # Check exact match first
+                if marker_name in marker_lookup:
+                    matched_configs = marker_lookup[marker_name]
                 else:
-                    marker_files = list(root.rglob(marker))
+                    # Check glob patterns (e.g., *.csproj)
+                    for marker, configs in marker_lookup.items():
+                        if "*" in marker:
+                            ext = marker.replace("*", "")
+                            if marker_name.endswith(ext):
+                                matched_configs = configs
+                                break
 
-                for marker_path in marker_files:
-                    if self._is_excluded(marker_path):
-                        continue
+                if not matched_configs:
+                    continue
 
-                    project_dir = marker_path.parent
-                    project_staleness = self._get_staleness_days(marker_path)
+                project_dir = marker_path.parent
 
+                for artifact_dirs, category, restore_hint in matched_configs:
                     for artifact_name in artifact_dirs:
                         artifact_path = project_dir / artifact_name
                         if not artifact_path.exists() or not artifact_path.is_dir():
@@ -418,7 +579,8 @@ class DccScout:
                         if self._is_snoozed(target):
                             continue
 
-                        size, file_count = self._get_dir_size(artifact_path)
+                        # Use fast size calculation
+                        size, file_count = self._get_dir_size_fast(artifact_path)
                         if size < 10 * 1e6:  # Skip if less than 10MB
                             continue
 
@@ -477,7 +639,19 @@ class DccScout:
             if not root.exists():
                 continue
 
-            for git_dir in root.rglob(".git"):
+            # Find .git directories using fd (exclude heavy non-git dirs)
+            if self._has_fd():
+                git_exclusions = ["Library", ".Trash", "CloudStorage", "Mobile Documents", "node_modules"]
+                git_dirs = self._fd_find(
+                    r"^\.git$",
+                    root,
+                    type_filter="d",
+                    exclude_dirs=git_exclusions,
+                )
+            else:
+                git_dirs = list(root.rglob(".git"))
+
+            for git_dir in git_dirs:
                 if not git_dir.is_dir():
                     continue
                 if self._is_excluded(git_dir):
@@ -489,8 +663,8 @@ class DccScout:
                 if self._is_snoozed(target):
                     continue
 
-                # Get .git directory size
-                size, file_count = self._get_dir_size(git_dir)
+                # Get .git directory size (use fast method)
+                size, file_count = self._get_dir_size_fast(git_dir)
 
                 if size < 100 * 1e6:  # Skip if less than 100MB
                     continue
@@ -1020,9 +1194,9 @@ class DccScout:
         """Find oversized log files."""
         print("Scanning log files...")
         findings = []
-        min_bytes = self.config["thresholds"]["log_file_min_mb"] * 1e6
+        min_mb = self.config["thresholds"]["log_file_min_mb"]
+        min_bytes = min_mb * 1e6
 
-        log_patterns = ["*.log", "*.log.*", "*.out", "*.err"]
         log_dirs = [
             Path.home() / "Library" / "Logs",
             Path.home() / ".local" / "share",
@@ -1032,38 +1206,55 @@ class DccScout:
             if not log_dir.exists():
                 continue
 
-            for pattern in log_patterns:
-                for log_file in log_dir.rglob(pattern):
-                    if not log_file.is_file():
+            # Find log files using fd with single regex pattern
+            if self._has_fd():
+                # Pattern matches: *.log, *.log.*, *.out, *.err
+                log_pattern = r"\.(log|log\.[^/]+|out|err)$"
+                size_filter = f"+{min_mb}m"
+                log_files = self._fd_find(
+                    log_pattern,
+                    log_dir,
+                    type_filter="f",
+                    size_filter=size_filter,
+                    exclude_dirs=[],  # Don't exclude anything in log dirs
+                )
+            else:
+                # Fallback: find logs one pattern at a time (slow)
+                log_files = []
+                for pattern in ["*.log", "*.log.*", "*.out", "*.err"]:
+                    log_files.extend(log_dir.rglob(pattern))
+
+            for log_file in log_files:
+                if not log_file.is_file():
+                    continue
+                if self._is_excluded(log_file):
+                    continue
+
+                try:
+                    size = log_file.stat().st_size
+                    if size < min_bytes:
                         continue
-                    if self._is_excluded(log_file):
+
+                    target = str(log_file).replace(str(Path.home()), "~")
+                    if self._is_snoozed(target):
                         continue
 
-                    try:
-                        size = log_file.stat().st_size
-                        if size < min_bytes:
-                            continue
+                    staleness = self._get_staleness_days(log_file)
 
-                        target = str(log_file).replace(str(Path.home()), "~")
-                        if self._is_snoozed(target):
-                            continue
+                    options = [{"id": "delete", "reclaim_bytes": size, "reversible": False}]
 
-                        staleness = self._get_staleness_days(log_file)
-
-                        options = [{"id": "delete", "reclaim_bytes": size, "reversible": False}]
-
-                        findings.append(self._make_finding(
-                            target=target,
-                            category="logs",
-                            size_bytes=size,
-                            file_count=1,
-                            staleness_days=staleness,
-                            reason="Log file, safe to delete",
-                            options=options,
-                            recommendation="delete",
-                        ))
-                    except OSError:
-                        continue
+                    findings.append(self._make_finding(
+                        target=target,
+                        category="logs",
+                        size_bytes=size,
+                        file_count=1,
+                        staleness_days=staleness,
+                        reason="Log file, safe to delete",
+                        options=options,
+                        recommendation="delete",
+                    ))
+                except OSError:
+                    continue
 
         self._save_phase_result("logs", findings)
         return findings
