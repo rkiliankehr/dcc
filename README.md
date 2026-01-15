@@ -105,15 +105,6 @@ DCC stores its data in `~/.dcc/`:
 2. **TUI** (`cleanup-tui.py`) - Displays findings sorted by size, lets you pick actions
 3. **Executor** - Shows exact commands, asks for confirmation, runs them
 
-## Performance
-
-Using `fd` instead of Python's `os.walk`:
-
-| Metric | Before | After |
-|--------|--------|-------|
-| Full scan | 17 min | 1 min 22 sec |
-| Speedup | - | **12.5x faster** |
-
 ## License
 
 MIT
