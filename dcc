@@ -1,15 +1,60 @@
 #!/bin/bash
 # DCC - Disk Cleanup Consultant
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_SCAN="$HOME/.dcc/scan.json"
-FALLBACK="$SCRIPT_DIR/test/sample-findings.json"
 
-if [ -n "$1" ]; then
-    INPUT="$1"
-elif [ -f "$DEFAULT_SCAN" ]; then
-    INPUT="$DEFAULT_SCAN"
-else
-    INPUT="$FALLBACK"
-fi
+DCC_DIR="$HOME/.dcc"
+DCC_HOME="$(cd "$(dirname "$0")" && pwd)"
+SCAN_FILE="$DCC_DIR/scan.json"
+MAX_AGE=86400  # 24 hours in seconds
 
-exec "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/cleanup-tui.py" "$INPUT"
+usage() {
+    echo "Usage: dcc [command]"
+    echo ""
+    echo "Commands:"
+    echo "  (none)    Open TUI (auto-scans if data is stale)"
+    echo "  scan      Run scanner only"
+    echo "  tui       Open TUI without scanning"
+    echo ""
+}
+
+run_scan() {
+    cd "$DCC_HOME" && python3 dcc-scout.py
+}
+
+run_tui() {
+    cd "$DCC_HOME" && python3 cleanup-tui.py
+}
+
+case "${1:-}" in
+    scan)
+        run_scan
+        ;;
+    tui)
+        if [[ ! -f "$SCAN_FILE" ]]; then
+            echo "No scan data found. Run 'dcc scan' first."
+            exit 1
+        fi
+        run_tui
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    "")
+        # Default: scan if stale, then TUI
+        if [[ ! -f "$SCAN_FILE" ]]; then
+            echo "No scan data. Running initial scan..."
+            run_scan
+        else
+            age=$(($(date +%s) - $(stat -f %m "$SCAN_FILE")))
+            if [[ $age -gt $MAX_AGE ]]; then
+                echo "Scan data is $(($age / 3600))h old. Refreshing..."
+                run_scan
+            fi
+        fi
+        run_tui
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac

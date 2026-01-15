@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
         "large_files": True,
         "build_artifacts": True,
         "git_repos": True,
+        "ollama_models": True,
+        "huggingface_models": True,
         "applications": True,
         "library_leftovers": True,
         "caches": True,
@@ -69,18 +71,18 @@ BUILD_ARTIFACTS = [
     ("Podfile", ["Pods"], "ios", "pod install"),
 ]
 
-# Cache directories to scan (~/Library/Caches scanned by subdirectory separately)
+# Cache directories to scan (~/Library/Caches and ~/.cache scanned by subdirectory)
 CACHE_DIRS = [
     ("~/Library/Developer/CoreSimulator/Caches", "cache"),
-    ("~/.cache", "cache"),
     ("~/.npm/_cacache", "cache"),
     ("~/.cargo/registry/cache", "cache"),
 ]
 
-# Directories that indicate LLM models
+# Subdirectories to skip when scanning ~/.cache (handled by dedicated phases)
+CACHE_SKIP_SUBDIRS = {"huggingface", "torch"}
+
+# Directories that indicate LLM models (ollama/huggingface handled by dedicated phases)
 MODEL_DIRS = [
-    ("~/.ollama/models", "model"),
-    ("~/.cache/huggingface", "model"),
     ("~/.cache/torch", "model"),
 ]
 
@@ -295,6 +297,15 @@ class DccScout:
                 if not path.is_file():
                     continue
                 if self._is_excluded(path):
+                    continue
+                # Skip files inside .git directories (handled by git-gc phase)
+                if ".git" in path.parts:
+                    continue
+                # Skip ollama blobs (handled by ollama_models phase)
+                if ".ollama" in path.parts and "blobs" in path.parts:
+                    continue
+                # Skip huggingface cache (handled by huggingface_models phase)
+                if "huggingface" in path.parts and "hub" in path.parts:
                     continue
 
                 try:
@@ -541,6 +552,170 @@ class DccScout:
         self._save_phase_result("git_repos", findings)
         return findings
 
+    # === PHASE: Ollama Models ===
+    def scan_ollama_models(self) -> list:
+        """Find ollama models and map blobs to human-readable names."""
+        print("Scanning ollama models...")
+        findings = []
+
+        ollama_dir = Path.home() / ".ollama"
+        manifests_dir = ollama_dir / "models" / "manifests" / "registry.ollama.ai" / "library"
+        blobs_dir = ollama_dir / "models" / "blobs"
+
+        if not manifests_dir.exists() or not blobs_dir.exists():
+            self._save_phase_result("ollama_models", findings)
+            return findings
+
+        # Parse all manifests to get model -> blob mappings
+        for model_dir in manifests_dir.iterdir():
+            if not model_dir.is_dir():
+                continue
+
+            model_name = model_dir.name
+
+            for tag_file in model_dir.iterdir():
+                if not tag_file.is_file():
+                    continue
+
+                tag = tag_file.name
+                model_tag = f"{model_name}:{tag}"
+                target = f"ollama:{model_tag}"
+
+                if self._is_snoozed(target):
+                    continue
+
+                try:
+                    with open(tag_file) as f:
+                        manifest = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+                # Calculate total size from layers
+                total_size = 0
+                layer_count = 0
+                model_blob_path = None
+
+                for layer in manifest.get("layers", []):
+                    digest = layer.get("digest", "")
+                    layer_size = layer.get("size", 0)
+                    media_type = layer.get("mediaType", "")
+
+                    # Track the main model blob for staleness check
+                    if "model" in media_type and layer_size > 100_000_000:
+                        blob_name = digest.replace(":", "-")
+                        model_blob_path = blobs_dir / blob_name
+
+                    total_size += layer_size
+                    layer_count += 1
+
+                if total_size < 100 * 1e6:  # Skip if less than 100MB
+                    continue
+
+                # Get staleness from the model blob file
+                staleness = 0
+                if model_blob_path and model_blob_path.exists():
+                    staleness = self._get_staleness_days(model_blob_path)
+
+                options = [{
+                    "id": "ollama-rm",
+                    "reclaim_bytes": total_size,
+                    "reversible": False,
+                    "command": f"ollama rm {model_tag}"
+                }]
+
+                # Recommend delete if stale (not used in 30+ days)
+                if staleness > 30:
+                    recommendation = "delete"
+                    reason = f"ollama rm {model_tag}"
+                else:
+                    recommendation = "skip"
+                    reason = f"ollama rm {model_tag}"
+
+                findings.append(self._make_finding(
+                    target=target,
+                    category="ollama",
+                    size_bytes=total_size,
+                    file_count=layer_count,
+                    staleness_days=staleness,
+                    reason=reason,
+                    options=options,
+                    recommendation=recommendation,
+                    model_name=model_name,
+                    model_tag=tag,
+                ))
+
+        self._save_phase_result("ollama_models", findings)
+        return findings
+
+    # === PHASE: Huggingface Models ===
+    def scan_huggingface_models(self) -> list:
+        """Find huggingface cached models and map to human-readable names."""
+        print("Scanning huggingface models...")
+        findings = []
+
+        hf_hub = Path.home() / ".cache" / "huggingface" / "hub"
+        if not hf_hub.exists():
+            self._save_phase_result("huggingface_models", findings)
+            return findings
+
+        # Scan model directories (format: models--{org}--{name})
+        for model_dir in hf_hub.iterdir():
+            if not model_dir.is_dir():
+                continue
+            if not model_dir.name.startswith("models--"):
+                continue
+
+            # Parse model name from directory: models--org--name -> org/name
+            parts = model_dir.name.split("--")
+            if len(parts) >= 3:
+                org = parts[1]
+                model_name = "--".join(parts[2:])  # Handle names with dashes
+                display_name = f"{org}/{model_name}"
+            else:
+                display_name = model_dir.name
+
+            target = f"huggingface:{display_name}"
+
+            if self._is_snoozed(target):
+                continue
+
+            # Calculate total size
+            size, file_count = self._get_dir_size(model_dir)
+
+            if size < 100 * 1e6:  # Skip if less than 100MB
+                continue
+
+            staleness = self._get_staleness_days(model_dir)
+
+            options = [{
+                "id": "hf-delete",
+                "reclaim_bytes": size,
+                "reversible": False,
+                "command": f"rm -rf {model_dir}"
+            }]
+
+            # Recommend delete if stale (not used in 30+ days)
+            if staleness > 30:
+                recommendation = "delete"
+            else:
+                recommendation = "skip"
+
+            findings.append(self._make_finding(
+                target=target,
+                category="huggingface",
+                size_bytes=size,
+                file_count=file_count,
+                staleness_days=staleness,
+                reason=f"huggingface-cli download {display_name}",
+                options=options,
+                recommendation=recommendation,
+                model_org=org if len(parts) >= 3 else None,
+                model_name=model_name if len(parts) >= 3 else None,
+            ))
+
+        self._save_phase_result("huggingface_models", findings)
+        return findings
+
     # === PHASE: Applications ===
     def scan_applications(self) -> list:
         """Find large/stale applications."""
@@ -739,6 +914,40 @@ class DccScout:
                     recommendation="delete",
                 ))
 
+        # Scan ~/.cache subdirectories individually (skip those handled by dedicated phases)
+        dot_cache = Path.home() / ".cache"
+        if dot_cache.exists():
+            for item in dot_cache.iterdir():
+                if not item.is_dir():
+                    continue
+                if item.name in CACHE_SKIP_SUBDIRS:
+                    continue
+                if self._is_excluded(item):
+                    continue
+
+                target = str(item).replace(str(Path.home()), "~")
+                if self._is_snoozed(target):
+                    continue
+
+                size, file_count = self._get_dir_size(item)
+                if size < 100 * 1e6:  # Skip if less than 100MB
+                    continue
+
+                staleness = self._get_staleness_days(item)
+
+                options = [{"id": "delete", "reclaim_bytes": size, "reversible": False}]
+
+                findings.append(self._make_finding(
+                    target=target,
+                    category="cache",
+                    size_bytes=size,
+                    file_count=file_count,
+                    staleness_days=staleness,
+                    reason="Cache, auto-regenerates",
+                    options=options,
+                    recommendation="delete",
+                ))
+
         # Also scan other cache locations
         for cache_path, category in CACHE_DIRS:
             path = Path(cache_path).expanduser()
@@ -864,8 +1073,8 @@ class DccScout:
         """Merge all phase results into final scan.json."""
         all_findings = []
 
-        phases = ["large_files", "build_artifacts", "git_repos",
-                  "applications", "library_leftovers", "caches", "logs"]
+        phases = ["large_files", "build_artifacts", "git_repos", "ollama_models",
+                  "huggingface_models", "applications", "library_leftovers", "caches", "logs"]
 
         for phase in phases:
             results = self._load_phase_result(phase)
@@ -924,6 +1133,8 @@ class DccScout:
             "large_files": self.scan_large_files,
             "build_artifacts": self.scan_build_artifacts,
             "git_repos": self.scan_git_repos,
+            "ollama_models": self.scan_ollama_models,
+            "huggingface_models": self.scan_huggingface_models,
             "applications": self.scan_applications,
             "library_leftovers": self.scan_library_leftovers,
             "caches": self.scan_caches,

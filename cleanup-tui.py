@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """DCC - Disk Cleanup Consultant. Textual-based TUI for reviewing and executing disk cleanup actions."""
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,19 +13,109 @@ from textual.screen import Screen
 from rich.text import Text
 from rich.table import Table
 from rich.console import Console
+from datetime import datetime, timedelta
+
+# DCC state directory
+DCC_DIR = Path.home() / ".dcc"
+SNOOZE_DAYS = 14  # Default snooze duration
+
+
+def load_snoozed() -> dict:
+    """Load snoozed targets from disk. Returns {target: expires_at}."""
+    snoozed_path = DCC_DIR / "snoozed.json"
+    if not snoozed_path.exists():
+        return {}
+
+    try:
+        with open(snoozed_path) as f:
+            data = json.load(f)
+
+        now = datetime.now()
+        active = {}
+        for item in data.get("items", []):
+            expires = datetime.fromisoformat(item["expires_at"])
+            if expires > now:
+                active[item["target"]] = item["expires_at"]
+        return active
+    except (json.JSONDecodeError, KeyError):
+        return {}
+
+
+def save_snoozed(snoozed: dict) -> None:
+    """Save snoozed targets to disk. Input: {target: expires_at}."""
+    DCC_DIR.mkdir(parents=True, exist_ok=True)
+    snoozed_path = DCC_DIR / "snoozed.json"
+
+    items = [{"target": t, "expires_at": e} for t, e in snoozed.items()]
+    with open(snoozed_path, "w") as f:
+        json.dump({"items": items}, f, indent=2)
+
+
+def add_snooze(target: str, days: int = SNOOZE_DAYS) -> dict:
+    """Add a snooze for a target. Returns updated snoozed dict."""
+    snoozed = load_snoozed()
+    expires = (datetime.now() + timedelta(days=days)).isoformat()
+    snoozed[target] = expires
+    save_snoozed(snoozed)
+    return snoozed
+
+
+def remove_snooze(target: str) -> dict:
+    """Remove a snooze for a target. Returns updated snoozed dict."""
+    snoozed = load_snoozed()
+    snoozed.pop(target, None)
+    save_snoozed(snoozed)
+    return snoozed
+
+
+def target_exists(target: str) -> bool:
+    """Check if a target still exists on disk."""
+    if target.startswith("ollama:"):
+        # ollama:model:tag - check via ollama list
+        try:
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return True  # Assume exists if we can't check
+            # Parse output: "NAME    ID    SIZE    MODIFIED"
+            model_tag = target[7:]  # Remove "ollama:" prefix
+            for line in result.stdout.strip().split("\n")[1:]:  # Skip header
+                if line.split()[0] == model_tag:
+                    return True
+            return False
+        except Exception:
+            return True  # Assume exists if error
+    elif target.startswith("huggingface:"):
+        # huggingface:org/model - check hub cache path
+        model_id = target[12:]  # Remove "huggingface:" prefix
+        cache_name = f"models--{model_id.replace('/', '--')}"
+        cache_path = Path.home() / ".cache" / "huggingface" / "hub" / cache_name
+        return cache_path.exists()
+    else:
+        # Regular path
+        path = Path(target).expanduser()
+        return path.exists()
+
 
 # Category labels
 CATEGORIES = {
     "app": "App", "node": "Node", "rust": "Rust", "venv": "Venv", "model": "Model",
     "cache": "Cache", "logs": "Logs", "git": "Git", "backup": "Backup", "archive": "Archiv",
-    "orphan": "Orphan", "file": "File", "data": "Data"
+    "orphan": "Orphan", "file": "File", "data": "Data", "ollama": "Ollama", "dotnet": ".NET",
+    "java": "Java", "go": "Go", "swift": "Swift", "ios": "iOS", "huggingface": "HF",
 }
 
-# Action abbreviations (3 chars max, lowercase like verbs)
+# Action abbreviations (max 4 chars, lowercase like verbs)
 ACTIONS = {
     "delete": "del",
     "compress": "zip",
     "git-gc": "gc",
+    "ollama-rm": "rm",
+    "hf-delete": "del",
     "restore": "rst",
     "skip": "skip",
 }
@@ -70,7 +161,8 @@ class FindingItem(ListItem):
             term_width = self.app.size.width if self.app else 80
         except Exception:
             term_width = 80
-        path_width = max(20, term_width - 36)  # account for wider category column
+        # Columns: marker(3) + size(8) + cat(7) + action(5) + days(6) + spaces(6) + scrollbar(2) = ~37
+        path_width = max(20, term_width - 40)
         target = shorten_path(f["target"], path_width)
 
         # Build row content - use Rich Text object for reliable background
@@ -224,11 +316,67 @@ class ActionSelector(Screen):
             self.app.pop_screen()
 
 
+def _needs_sudo(target: str) -> bool:
+    """Check if a path likely needs sudo to modify."""
+    # Expand ~ for checking
+    if target.startswith("~"):
+        expanded = str(Path.home()) + target[1:]
+    else:
+        expanded = target
+
+    # Paths in user's home directory don't need sudo
+    home = str(Path.home())
+    if expanded.startswith(home):
+        return False
+
+    # Virtual paths (ollama:, huggingface:) don't need sudo check
+    if ":" in target and not target.startswith("/"):
+        return False
+
+    # System paths need sudo
+    system_paths = ["/Applications", "/Library", "/usr", "/opt", "/var", "/private"]
+    for sp in system_paths:
+        if expanded.startswith(sp):
+            return True
+
+    return False
+
+
+def _get_command_for_action(finding: dict, action: str) -> tuple[str, bool]:
+    """Generate the actual shell command for an action.
+
+    Returns: (command, needs_sudo)
+    """
+    target = finding["target"]
+    sudo = _needs_sudo(target)
+    prefix = "sudo " if sudo else ""
+
+    if action == "ollama-rm":
+        # ollama:model:tag -> ollama rm model:tag
+        model_tag = target.replace("ollama:", "")
+        return f"ollama rm {model_tag}", False
+    elif action == "hf-delete":
+        # huggingface:org/model -> rm -rf ~/.cache/huggingface/hub/models--org--model
+        model_name = target.replace("huggingface:", "")
+        org, name = model_name.split("/", 1) if "/" in model_name else ("", model_name)
+        hf_dir = f"~/.cache/huggingface/hub/models--{org}--{name}"
+        return f"rm -rf {hf_dir}", False
+    elif action == "git-gc":
+        # ~/.../repo/.git -> git -C ~/.../repo gc
+        repo_dir = target.replace("/.git", "")
+        return f"{prefix}git -C {repo_dir} gc --aggressive --prune=now", sudo
+    elif action == "compress":
+        return f"{prefix}zip -r {target}.zip {target} && {prefix}rm -rf {target}", sudo
+    else:
+        # Default: rm -rf
+        return f"{prefix}rm -rf {target}", sudo
+
+
 class ConfirmScreen(Screen):
     """Confirmation screen before execution."""
 
     BINDINGS = [
-        Binding("y", "confirm", "Yes", priority=True),
+        Binding("ctrl+y", "confirm", "Execute", priority=True),
         Binding("n", "cancel", "No", priority=True),
         Binding("escape", "cancel", "Cancel", show=False, priority=True),
     ]
@@ -241,52 +389,106 @@ class ConfirmScreen(Screen):
 
     def compose(self) -> ComposeResult:
         with Container(id="confirm-container"):
-            yield Static("[bold]Confirm Actions[/]\n", id="confirm-header")
+            yield Static("[bold red]CONFIRM EXECUTION[/]\n", id="confirm-header")
 
-            # Group by action
-            deletes = [(i.finding, i.selected_action) for i in self.items if "delete" in i.selected_action]
-            compresses = [(i.finding, i.selected_action) for i in self.items if "compress" in i.selected_action]
-            git_gcs = [(i.finding, i.selected_action) for i in self.items if "git-gc" in i.selected_action]
+            # Group by action type
+            rm_items = []      # rm -rf (regular deletes)
+            ollama_items = []  # ollama rm
+            hf_items = []      # huggingface deletes
+            git_items = []     # git gc
+            zip_items = []     # compress
+
+            for item in self.items:
+                action = item.selected_action
+                if action == "ollama-rm":
+                    ollama_items.append(item)
+                elif action == "hf-delete":
+                    hf_items.append(item)
+                elif action == "git-gc":
+                    git_items.append(item)
+                elif action == "compress":
+                    zip_items.append(item)
+                elif "delete" in action:
+                    rm_items.append(item)
 
             content = []
-            total = 0
+            total_gb = 0
+            has_sudo = False
 
-            if deletes:
-                content.append("[bold red]🗑️  DELETE (permanent):[/]")
-                del_total = 0
-                for f, _ in deletes:
-                    content.append(f"    {f['size_human']:>8}  {f['target']}")
-                    del_total += f["size_bytes"] / 1e9
-                content.append(f"    [dim]{'─' * 40}[/]")
-                content.append(f"    [bold]{del_total:.1f} GB[/]")
+            def add_item(item, savings_override=None):
+                nonlocal total_gb, has_sudo
+                f = item.finding
+                cmd, needs_sudo = _get_command_for_action(f, item.selected_action)
+                if needs_sudo:
+                    has_sudo = True
+                    cmd_display = f"[bold yellow]{cmd}[/]"
+                else:
+                    cmd_display = f"[dim]{cmd}[/]"
+
+                if savings_override is not None:
+                    size_str = f"~{savings_override:.1f} GB"
+                    total_gb += savings_override
+                else:
+                    size_str = f['size_human']
+                    total_gb += f["size_bytes"] / 1e9
+
+                content.append(f"  [cyan]{size_str:>8}[/]  {cmd_display}")
+
+            # rm -rf section
+            if rm_items:
+                content.append("[bold red]rm -rf[/] [dim](permanent delete)[/]")
                 content.append("")
-                total += del_total
-
-            if compresses:
-                content.append("[bold green]📦 COMPRESS (reversible):[/]")
-                comp_total = 0
-                for f, _ in compresses:
-                    content.append(f"    {f['size_human']:>8}  {f['target']}")
-                    comp_total += f["size_bytes"] / 1e9
-                savings = comp_total * 0.8
-                content.append(f"    [dim]{'─' * 40}[/]")
-                content.append(f"    [bold]~{savings:.1f} GB[/] savings")
-                content.append("")
-                total += savings
-
-            if git_gcs:
-                content.append("[bold magenta]🔧 GIT GC:[/]")
-                for f, _ in git_gcs:
-                    content.append(f"    {f['size_human']:>8}  {f['target']}")
+                for item in rm_items:
+                    add_item(item)
                 content.append("")
 
-            content.append(f"[bold]{'═' * 50}[/]")
-            content.append(f"[bold]ESTIMATED SAVINGS: [cyan]{total:.1f} GB[/][/]")
+            # ollama rm section
+            if ollama_items:
+                content.append("[bold red]ollama rm[/] [dim](remove model)[/]")
+                content.append("")
+                for item in ollama_items:
+                    add_item(item)
+                content.append("")
+
+            # huggingface section
+            if hf_items:
+                content.append("[bold red]rm -rf[/] [dim](huggingface cache)[/]")
+                content.append("")
+                for item in hf_items:
+                    add_item(item)
+                content.append("")
+
+            # git gc section
+            if git_items:
+                content.append("[bold yellow]git gc[/] [dim](compress git history)[/]")
+                content.append("")
+                for item in git_items:
+                    f = item.finding
+                    savings = f.get("gc_potential_bytes", f["size_bytes"] * 0.2) / 1e9
+                    add_item(item, savings_override=savings)
+                content.append("")
+
+            # zip section
+            if zip_items:
+                content.append("[bold green]zip[/] [dim](compress, reversible)[/]")
+                content.append("")
+                for item in zip_items:
+                    f = item.finding
+                    savings = f["size_bytes"] * 0.7 / 1e9  # ~70% compression
+                    add_item(item, savings_override=savings)
+                content.append("")
+
+            # Summary
+            content.append(f"[dim]{'─' * 60}[/]")
+            content.append(f"[bold]ESTIMATED SAVINGS: [green]{total_gb:.1f} GB[/][/]")
+
+            if has_sudo:
+                content.append("")
+                content.append("[bold yellow]⚠ Some commands require sudo (highlighted)[/]")
 
             yield Static("\n".join(content), id="confirm-content")
 
-        # Custom nav bar - magenta/violet spectrum like Claude
-        yield Static("[bold magenta]y[/] Execute  [bold magenta]n[/] Cancel", id="confirm-nav")
+        yield Static("[bold green]^y[/] Execute  [bold magenta]n/esc[/] Cancel", id="confirm-nav")
 
     def action_confirm(self) -> None:
         self.app.exit(result=self.items)
@@ -300,7 +502,7 @@ class CleanupApp(App):
 
     CSS = """
     Screen {
-        background: $surface;
+        background: #1e1e1e;
     }
 
     #main-container {
@@ -308,24 +510,30 @@ class CleanupApp(App):
     }
 
     #status-bar {
-        height: 1;
+        height: 2;
         padding: 0 1;
+        background: #252525;
     }
 
     #separator-top {
         height: 1;
         padding: 0 1;
+        color: #404040;
     }
 
     #findings-list {
         height: 1fr;
         background: transparent;
+        scrollbar-background: #2d2d2d;
+        scrollbar-color: #606060;
+        scrollbar-color-hover: #808080;
+        scrollbar-color-active: #a0a0a0;
     }
 
     #details-panel {
         height: 8;
-        background: transparent;
-        border-top: solid gray;
+        background: #252525;
+        border-top: solid #404040;
         padding: 0 1;
     }
 
@@ -350,7 +558,7 @@ class CleanupApp(App):
     #action-nav, #confirm-nav, #main-nav {
         dock: bottom;
         height: 1;
-        background: $primary-background;
+        background: #252525;
         padding: 0 1;
     }
 
@@ -359,12 +567,11 @@ class CleanupApp(App):
     }
 
     ListItem:hover {
-        background: transparent;
+        background: #2a2a2a;
     }
 
     ListItem.--highlight {
-        background: cyan !important;
-        color: black;
+        background: #37373d;
     }
     """
 
@@ -388,6 +595,7 @@ class CleanupApp(App):
         self.findings = []  # Sorted findings list
         self.item_state = {}  # State by index: {idx: {marked, snoozed, selected_action}}
         self.hide_skip = False  # Toggle to hide items with "skip" recommendation
+        self.initially_snoozed = set()  # Targets that were snoozed on load
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-container"):
@@ -411,13 +619,26 @@ class CleanupApp(App):
             reverse=True
         )
 
-        # Initialize state for all items
+        # Load persisted snoozes
+        snoozed_targets = load_snoozed()
+        self.initially_snoozed = set(snoozed_targets.keys())
+
+        # Initialize state for all items, checking if targets still exist
+        cleaned_count = 0
         for i, finding in enumerate(self.findings):
+            target = finding["target"]
+            is_cleaned = not target_exists(target)
+            if is_cleaned:
+                cleaned_count += 1
             self.item_state[i] = {
                 "marked": False,
-                "snoozed": False,
+                "snoozed": target in snoozed_targets,
+                "cleaned": is_cleaned,
                 "selected_action": finding.get("recommendation", "delete"),
             }
+
+        if cleaned_count > 0:
+            self.notify(f"{cleaned_count} item(s) already cleaned")
 
         # Populate visible list
         self.refresh_list()
@@ -448,13 +669,19 @@ class CleanupApp(App):
         has_items = False
         # Create new widgets for visible items, restoring state
         for i, finding in enumerate(self.findings):
-            should_hide = self.hide_skip and finding.get("recommendation") == "skip"
-            if should_hide:
+            state = self.item_state[i]
+            # Hide cleaned items (already deleted)
+            if state.get("cleaned"):
+                continue
+            # Hide snoozed items
+            if state["snoozed"]:
+                continue
+            # Hide skip items if toggle is on
+            if self.hide_skip and finding.get("recommendation") == "skip":
                 continue
 
             item = FindingItem(finding, i)
             # Restore state
-            state = self.item_state[i]
             item.marked = state["marked"]
             item.snoozed = state["snoozed"]
             item.selected_action = state["selected_action"]
@@ -468,22 +695,45 @@ class CleanupApp(App):
 
     def update_status(self) -> None:
         total_count = len(self.findings)
-        total_gb = sum(f["size_bytes"] for f in self.findings) / 1e9
         marked_count = sum(1 for s in self.item_state.values() if s["marked"])
         marked_gb = sum(self.findings[i]["size_bytes"] / 1e9 for i, s in self.item_state.items() if s["marked"])
         snoozed_count = sum(1 for s in self.item_state.values() if s["snoozed"])
+        cleaned_count = sum(1 for s in self.item_state.values() if s.get("cleaned"))
         skip_count = sum(1 for f in self.findings if f.get("recommendation") == "skip")
-        visible_count = total_count - skip_count if self.hide_skip else total_count
+        # Visible = total - snoozed - cleaned - (skip if hidden)
+        hidden_skip = skip_count if self.hide_skip else 0
+        visible_count = total_count - snoozed_count - cleaned_count - hidden_skip
+        # Total GB excludes cleaned items (only actionable space)
+        total_gb = sum(self.findings[i]["size_bytes"] for i, s in self.item_state.items() if not s.get("cleaned")) / 1e9
+
+        # Get disk space info
+        disk = shutil.disk_usage(Path.home())
+        disk_free_gb = disk.free / 1e9
+        disk_used_pct = (disk.used / disk.total) * 100
+
+        # Calculate padding for right-aligned disk info
+        try:
+            term_width = self.app.size.width if self.app else 80
+        except Exception:
+            term_width = 80
 
         status = self.query_one("#status-bar", Static)
         snoozed_part = f"  [dim]Snoozed:[/] [dim]{snoozed_count}[/]" if snoozed_count > 0 else ""
         hidden_part = f"  [dim]Hidden:[/] [dim]{skip_count}[/]" if self.hide_skip else ""
-        status.update(
-            f"[bold magenta]DCC[/] [dim italic]Disk Cleanup Consultant[/]  "
-            f"[dim]Showing:[/] [cyan]{visible_count}[/] items ([cyan]{total_gb:.1f} GB[/])  "
-            f"[dim]Selected:[/] [rgb(255,140,0)]{marked_count}[/] ([rgb(255,140,0)]{marked_gb:.1f} GB[/])"
-            f"{snoozed_part}{hidden_part}"
-        )
+
+        # Line 1
+        line1_left = "DCC Disk Cleanup Consultant"
+        line1_right = f"{disk_free_gb:.0f} GB free ({disk_used_pct:.0f}% used)"
+        line1_pad = term_width - len(line1_left) - len(line1_right) - 2
+        line1 = f"[bold magenta]DCC[/] [dim]Disk Cleanup Consultant[/]{' ' * line1_pad}[green]{disk_free_gb:.0f} GB[/] free ({disk_used_pct:.0f}% used)"
+
+        # Line 2
+        line2_left_plain = f"Showing: {visible_count} ({total_gb:.1f} GB)"
+        line2_right_plain = f"Selected: {marked_count} ({marked_gb:.1f} GB)"
+        line2_pad = term_width - len(line2_left_plain) - len(line2_right_plain) - 2
+        line2 = f"[dim]Showing:[/] [cyan]{visible_count}[/] ([cyan]{total_gb:.1f} GB[/]){' ' * line2_pad}[dim]Selected:[/] [rgb(255,140,0)]{marked_count}[/] ([rgb(255,140,0)]{marked_gb:.1f} GB[/])"
+
+        status.update(f"{line1}\n{line2}")
 
     def update_details(self) -> None:
         findings_list = self.query_one("#findings-list", ListView)
@@ -582,9 +832,27 @@ class CleanupApp(App):
         if findings_list.highlighted_child and isinstance(findings_list.highlighted_child, FindingItem):
             item = findings_list.highlighted_child
             item.toggle_snooze()
-            # Save state
+            # Save state in memory only - will persist on ctrl+x
             self.item_state[item.index]["snoozed"] = item.snoozed
             self.update_status()
+
+    def _save_snoozes(self) -> None:
+        """Persist all current snooze states to disk."""
+        # Load existing snoozes (to preserve ones not in current view)
+        snoozed = load_snoozed()
+
+        # Update with current session's snooze states
+        for i, state in self.item_state.items():
+            target = self.findings[i]["target"]
+            if state["snoozed"]:
+                if target not in snoozed:
+                    expires = (datetime.now() + timedelta(days=SNOOZE_DAYS)).isoformat()
+                    snoozed[target] = expires
+            else:
+                # Remove if un-snoozed
+                snoozed.pop(target, None)
+
+        save_snoozed(snoozed)
 
     def action_toggle_hide_skip(self) -> None:
         """Toggle hiding of items with 'skip' recommendation."""
@@ -632,6 +900,16 @@ class CleanupApp(App):
             subprocess.run(["open", "-R", str(path)], check=False)
 
     def action_execute(self) -> None:
+        # Find newly snoozed items (not in initially_snoozed)
+        newly_snoozed = []
+        for i, state in self.item_state.items():
+            target = self.findings[i]["target"]
+            if state["snoozed"] and target not in self.initially_snoozed:
+                newly_snoozed.append(self.findings[i])
+
+        # Save snoozes to disk
+        self._save_snoozes()
+
         # Build list of marked items from state
         class MarkedItem:
             def __init__(self, finding, selected_action):
@@ -645,6 +923,160 @@ class CleanupApp(App):
 
         if marked:
             self.push_screen(ConfirmScreen(marked))
+        elif newly_snoozed:
+            # Exit with details of newly snoozed items
+            lines = [f"Snoozed {len(newly_snoozed)} item(s):"]
+            for f in newly_snoozed:
+                lines.append(f"  {f['size_human']:>8}  {f['target']}")
+            self.exit(message="\n".join(lines))
+        else:
+            self.notify("No items marked or snoozed", timeout=2)
+
+
+def execute_actions(items: list) -> dict:
+    """Execute the cleanup actions and return results."""
+    results = {
+        "success": [],
+        "failed": [],
+        "total_reclaimed": 0,
+    }
+
+    print("\n\033[1mExecuting cleanup actions...\033[0m\n")
+
+    for i, item in enumerate(items, 1):
+        finding = item.finding
+        action = item.selected_action
+        target = finding["target"]
+        size = finding["size_bytes"]
+
+        cmd, needs_sudo = _get_command_for_action(finding, action)
+
+        # Progress indicator
+        print(f"[{i}/{len(items)}] {cmd}")
+
+        try:
+            # Build the actual command to run
+            if action == "ollama-rm":
+                # ollama rm model:tag
+                model_tag = target.replace("ollama:", "")
+                result = subprocess.run(
+                    ["ollama", "rm", model_tag],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+            elif action == "hf-delete":
+                # rm -rf huggingface cache dir
+                model_name = target.replace("huggingface:", "")
+                org, name = model_name.split("/", 1) if "/" in model_name else ("", model_name)
+                hf_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{org}--{name}"
+                if hf_dir.exists():
+                    shutil.rmtree(hf_dir)
+                result = subprocess.CompletedProcess(args=[], returncode=0)
+            elif action == "git-gc":
+                # git gc --aggressive --prune=now
+                repo_dir = target.replace("/.git", "")
+                repo_path = Path(repo_dir).expanduser()
+                shell_cmd = ["git", "-C", str(repo_path), "gc", "--aggressive", "--prune=now"]
+                if needs_sudo:
+                    shell_cmd = ["sudo"] + shell_cmd
+                result = subprocess.run(
+                    shell_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+            elif action == "compress":
+                # zip -r target.zip target && rm -rf target
+                target_path = Path(target).expanduser()
+                zip_path = target_path.with_suffix(target_path.suffix + ".zip")
+                # Create zip
+                result = subprocess.run(
+                    ["zip", "-r", "-q", str(zip_path), str(target_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+                if result.returncode == 0:
+                    # Remove original
+                    shutil.rmtree(target_path)
+            else:
+                # Default: rm -rf
+                target_path = Path(target).expanduser()
+                if target_path.exists():
+                    if target_path.is_dir():
+                        shutil.rmtree(target_path)
+                    else:
+                        target_path.unlink()
+                result = subprocess.CompletedProcess(args=[], returncode=0)
+
+            if result.returncode == 0:
+                results["success"].append({
+                    "target": target,
+                    "action": action,
+                    "size": size,
+                    "cmd": cmd,
+                })
+                results["total_reclaimed"] += size
+                print(f"       \033[32m✓\033[0m {finding['size_human']} reclaimed")
+            else:
+                results["failed"].append({
+                    "target": target,
+                    "action": action,
+                    "cmd": cmd,
+                    "error": result.stderr or "Unknown error",
+                })
+                print(f"       \033[31m✗\033[0m {result.stderr.strip() if result.stderr else 'Failed'}")
+
+        except subprocess.TimeoutExpired:
+            results["failed"].append({
+                "target": target,
+                "action": action,
+                "cmd": cmd,
+                "error": "Command timed out",
+            })
+            print(f"       \033[31m✗\033[0m Timeout")
+        except PermissionError as e:
+            results["failed"].append({
+                "target": target,
+                "action": action,
+                "cmd": cmd,
+                "error": f"Permission denied: {e}",
+            })
+            print(f"       \033[31m✗\033[0m Permission denied (try with sudo?)")
+        except Exception as e:
+            results["failed"].append({
+                "target": target,
+                "action": action,
+                "cmd": cmd,
+                "error": str(e),
+            })
+            print(f"       \033[31m✗\033[0m {e}")
+
+    return results
+
+
+def print_summary(results: dict) -> None:
+    """Print execution summary."""
+    print("\n" + "═" * 50)
+    print("\033[1mEXECUTION SUMMARY\033[0m")
+    print("═" * 50)
+
+    total_gb = results["total_reclaimed"] / 1e9
+    success_count = len(results["success"])
+    failed_count = len(results["failed"])
+
+    print(f"\n\033[32m✓ Successful:\033[0m {success_count} actions")
+    if results["success"]:
+        print(f"  \033[32mReclaimed: {total_gb:.2f} GB\033[0m")
+
+    if results["failed"]:
+        print(f"\n\033[31m✗ Failed:\033[0m {failed_count} actions")
+        for f in results["failed"]:
+            print(f"  • {f['target']}")
+            print(f"    {f['error']}")
+
+    print()
 
 
 def main():
@@ -657,10 +1089,17 @@ def main():
     app = CleanupApp(findings_file)
     result = app.run()
 
-    if result:
-        print("\n[Prototype] Would execute:")
-        for item in result:
-            print(f"  {item.selected_action}: {item.finding['target']} ({item.finding['size_human']})")
+    if isinstance(result, str):
+        # Message from exit (e.g., snooze saved)
+        print(f"\n{result}")
+    elif result:
+        # Execute the actions
+        results = execute_actions(result)
+        print_summary(results)
+
+        # Return exit code based on results
+        if results["failed"]:
+            sys.exit(1)
 
 
 if __name__ == "__main__":
